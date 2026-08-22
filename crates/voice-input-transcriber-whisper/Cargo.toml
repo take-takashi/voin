@@ -1,0 +1,13 @@
+[package]
+name = "voice-input-transcriber-whisper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+voice-input-core = { path = "../voice-input-core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16.0", features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = "0.16.0"

@@ -1,3 +1,9 @@
 [workspace]
-members = ["crates/voice-input-core"]
+members = [
+    "crates/voice-input-cli",
+    "crates/voice-input-core",
+    "crates/voice-input-recorder-cpal",
+    "crates/voice-input-sinks",
+    "crates/voice-input-transcriber-whisper",
+]
 resolver = "2"
