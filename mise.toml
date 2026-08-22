@@ -1,0 +1,18 @@
+[tools]
+rust = "1.91.1"
+
+[tasks.fmt]
+description = "Rustコードをフォーマットする"
+run = "cargo fmt --all"
+
+[tasks.check]
+description = "ワークスペースを型チェックする"
+run = "cargo check --workspace"
+
+[tasks.test]
+description = "ワークスペースのテストを実行する"
+run = "cargo test --workspace"
+
+[tasks.ci]
+description = "フォーマット、型チェック、テストを実行する"
+depends = ["fmt", "check", "test"]
