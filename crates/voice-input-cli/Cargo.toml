@@ -10,6 +10,7 @@ name = "voin-cli"
 path = "src/main.rs"
 
 [dependencies]
+ctrlc = "3.5.2"
 hound = "3.5.1"
 voice-input-core = { path = "../voice-input-core" }
 voice-input-recorder-cpal = { path = "../voice-input-recorder-cpal" }

@@ -1,7 +1,9 @@
 use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hound::{SampleFormat as WavSampleFormat, WavReader, WavSpec, WavWriter};
 use voice_input_core::{
@@ -95,6 +97,7 @@ fn record_command(args: &[String]) -> Result<(), String> {
         return Err("--duration must be a positive integer".to_owned());
     }
 
+    let cancel = install_cancellation_handler()?;
     let mut recorder = CpalRecorder::new();
     let options = RecordingOptions {
         max_duration: Duration::from_secs(duration_seconds),
@@ -104,13 +107,42 @@ fn record_command(args: &[String]) -> Result<(), String> {
     recorder
         .start(&options)
         .map_err(|error| format!("failed to start recording: {error}"))?;
+    if cancel.is_cancelled() {
+        recorder
+            .cancel()
+            .map_err(|error| format!("failed to cancel recording: {error}"))?;
+        return Err("operation cancelled".to_owned());
+    }
+
     eprintln!("recording for {duration_seconds} seconds...");
-    thread::sleep(Duration::from_secs(duration_seconds));
+    let duration = Duration::from_secs(duration_seconds);
+    let started = Instant::now();
+    while started.elapsed() < duration {
+        if cancel.is_cancelled() {
+            recorder
+                .cancel()
+                .map_err(|error| format!("failed to cancel recording: {error}"))?;
+            return Err("operation cancelled".to_owned());
+        }
+        let remaining = duration.saturating_sub(started.elapsed());
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+
+    if cancel.is_cancelled() {
+        recorder
+            .cancel()
+            .map_err(|error| format!("failed to cancel recording: {error}"))?;
+        return Err("operation cancelled".to_owned());
+    }
 
     let audio = recorder
         .stop()
         .map_err(|error| format!("failed to stop recording: {error}"))?;
-    write_wav(output, &audio)?;
+    if cancel.is_cancelled() {
+        return Err("operation cancelled".to_owned());
+    }
+
+    write_wav(output, &audio, &cancel)?;
     eprintln!("saved recording to {output}");
     Ok(())
 }
@@ -120,34 +152,52 @@ fn transcribe_command(args: &[String]) -> Result<(), String> {
     let model = required_flag(args, "--model")?;
     let sink_name = flag_value(args, "--sink").unwrap_or("stdout");
     let format = parse_output_format(flag_value(args, "--format").unwrap_or("plain"))?;
-    let audio = read_wav(input)?;
+    let cancel = install_cancellation_handler()?;
+    let audio = read_wav(input, &cancel)?;
+
+    if cancel.is_cancelled() {
+        return Err("operation cancelled".to_owned());
+    }
 
     let transcriber = WhisperTranscriber::from_model_path(model)
         .map_err(|error| format!("failed to initialize transcriber: {error}"))?;
-    let transcript = transcriber
-        .transcribe(
-            &audio,
-            &TranscriptionOptions {
-                language: LanguageMode::Auto,
-                ..TranscriptionOptions::default()
-            },
-            &CancellationToken::new(),
-        )
-        .map_err(|error| format!("transcription failed: {error}"))?;
+    let transcript = match transcriber.transcribe(
+        &audio,
+        &TranscriptionOptions {
+            language: LanguageMode::Auto,
+            ..TranscriptionOptions::default()
+        },
+        &cancel,
+    ) {
+        Ok(transcript) => transcript,
+        Err(_error) if cancel.is_cancelled() => return Err("operation cancelled".to_owned()),
+        Err(error) => return Err(format!("transcription failed: {error}")),
+    };
+
+    if cancel.is_cancelled() {
+        return Err("operation cancelled".to_owned());
+    }
+
     let processed = DeterministicPostProcessor
         .process(transcript, &ProcessingContext::default())
         .map_err(|error| format!("post-processing failed: {error}"))?;
 
+    if cancel.is_cancelled() {
+        return Err("operation cancelled".to_owned());
+    }
     if processed.text.is_empty() {
         return Err("transcription result is empty".to_owned());
     }
 
+    if cancel.is_cancelled() {
+        return Err("operation cancelled".to_owned());
+    }
     let output_context = OutputContext::new("cli-transcribe");
-    match sink_name {
+    let send_result = match sink_name {
         "stdout" => {
             let sink = StdoutSink::new(format);
             sink.send(&processed, &output_context)
-                .map_err(|error| format!("stdout output failed: {error}"))?;
+                .map_err(|error| format!("stdout output failed: {error}"))
         }
         "clipboard" => {
             if format == OutputFormat::Json {
@@ -156,24 +206,37 @@ fn transcribe_command(args: &[String]) -> Result<(), String> {
             let sink = ClipboardSink::new()
                 .map_err(|error| format!("failed to initialize clipboard: {error}"))?;
             sink.send(&processed, &output_context)
-                .map_err(|error| format!("clipboard output failed: {error}"))?;
+                .map_err(|error| format!("clipboard output failed: {error}"))
         }
         _ => return Err("--sink must be stdout or clipboard".to_owned()),
+    };
+
+    if cancel.is_cancelled() {
+        return Err("operation cancelled".to_owned());
     }
+    send_result?;
     Ok(())
 }
 
-fn write_wav(path: &str, audio: &AudioBuffer) -> Result<(), String> {
+fn write_wav(path: &str, audio: &AudioBuffer, cancel: &CancellationToken) -> Result<(), String> {
+    let output_path = Path::new(path);
+    let mut temporary = TemporaryOutput::new(temporary_output_path(output_path));
+    if cancel.is_cancelled() {
+        return Err("operation cancelled".to_owned());
+    }
     let spec = WavSpec {
         channels: 1,
         sample_rate: audio.sample_rate_hz,
         bits_per_sample: 16,
         sample_format: WavSampleFormat::Int,
     };
-    let mut writer =
-        WavWriter::create(path, spec).map_err(|error| format!("failed to create WAV: {error}"))?;
+    let mut writer = WavWriter::create(temporary.path(), spec)
+        .map_err(|error| format!("failed to create temporary WAV: {error}"))?;
 
     for sample in &audio.samples {
+        if cancel.is_cancelled() {
+            return Err("operation cancelled".to_owned());
+        }
         let sample = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
         writer
             .write_sample(sample)
@@ -182,10 +245,53 @@ fn write_wav(path: &str, audio: &AudioBuffer) -> Result<(), String> {
     writer
         .finalize()
         .map_err(|error| format!("failed to finalize WAV: {error}"))?;
+
+    if cancel.is_cancelled() {
+        return Err("operation cancelled".to_owned());
+    }
+    fs::rename(temporary.path(), output_path)
+        .map_err(|error| format!("failed to move WAV into place: {error}"))?;
+    temporary.commit();
     Ok(())
 }
 
-fn read_wav(path: &str) -> Result<AudioBuffer, String> {
+struct TemporaryOutput {
+    path: Option<PathBuf>,
+}
+
+impl TemporaryOutput {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn path(&self) -> &Path {
+        self.path
+            .as_deref()
+            .expect("temporary output path must be available")
+    }
+
+    fn commit(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TemporaryOutput {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn temporary_output_path(output: &Path) -> PathBuf {
+    let name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("voin-output");
+    output.with_file_name(format!(".{name}.{}.part", std::process::id()))
+}
+
+fn read_wav(path: &str, cancel: &CancellationToken) -> Result<AudioBuffer, String> {
     let mut reader =
         WavReader::open(path).map_err(|error| format!("failed to open WAV: {error}"))?;
     let spec = reader.spec();
@@ -195,22 +301,44 @@ fn read_wav(path: &str) -> Result<AudioBuffer, String> {
     }
 
     let samples = match (spec.sample_format, spec.bits_per_sample) {
-        (WavSampleFormat::Int, 16) => reader
-            .samples::<i16>()
-            .map(|sample| {
-                sample
-                    .map(|sample| f32::from(sample) / 32_768.0)
-                    .map_err(|error| format!("failed to read WAV sample: {error}"))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        (WavSampleFormat::Float, 32) => reader
-            .samples::<f32>()
-            .map(|sample| sample.map_err(|error| format!("failed to read WAV sample: {error}")))
-            .collect::<Result<Vec<_>, _>>()?,
+        (WavSampleFormat::Int, 16) => {
+            let mut samples = Vec::new();
+            for sample in reader.samples::<i16>() {
+                if cancel.is_cancelled() {
+                    return Err("operation cancelled".to_owned());
+                }
+                let sample =
+                    sample.map_err(|error| format!("failed to read WAV sample: {error}"))?;
+                samples.push(f32::from(sample) / 32_768.0);
+            }
+            samples
+        }
+        (WavSampleFormat::Float, 32) => {
+            let mut samples = Vec::new();
+            for sample in reader.samples::<f32>() {
+                if cancel.is_cancelled() {
+                    return Err("operation cancelled".to_owned());
+                }
+                samples
+                    .push(sample.map_err(|error| format!("failed to read WAV sample: {error}"))?);
+            }
+            samples
+        }
         _ => return Err("WAV input must use 16-bit integer or 32-bit float samples".to_owned()),
     };
 
+    if cancel.is_cancelled() {
+        return Err("operation cancelled".to_owned());
+    }
     Ok(AudioBuffer::new(samples, spec.sample_rate, spec.channels))
+}
+
+fn install_cancellation_handler() -> Result<CancellationToken, String> {
+    let cancel = CancellationToken::new();
+    let handler_cancel = cancel.clone();
+    ctrlc::set_handler(move || handler_cancel.cancel())
+        .map_err(|error| format!("failed to install Ctrl-C handler: {error}"))?;
+    Ok(cancel)
 }
 
 fn parse_output_format(value: &str) -> Result<OutputFormat, String> {
@@ -242,4 +370,34 @@ fn print_help() {
     println!(
         "  voin-cli transcribe --input /tmp/voice.wav --model /path/to/model.bin [--sink stdout|clipboard] [--format plain|json]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{temporary_output_path, write_wav};
+    use std::fs;
+    use voice_input_core::{AudioBuffer, CancellationToken};
+
+    #[test]
+    fn cancelled_wav_write_leaves_no_output_or_partial_file() {
+        let output = std::env::temp_dir().join(format!(
+            "voin-cancelled-{}-{}.wav",
+            std::process::id(),
+            "test"
+        ));
+        let temporary = temporary_output_path(&output);
+        let _ = fs::remove_file(&output);
+        let _ = fs::remove_file(&temporary);
+
+        let audio = AudioBuffer::new(vec![0.0; 16_000], 16_000, 1);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let error = write_wav(output.to_str().unwrap(), &audio, &cancel)
+            .expect_err("cancelled output must fail");
+
+        assert_eq!(error, "operation cancelled");
+        assert!(!output.exists());
+        assert!(!temporary.exists());
+    }
 }

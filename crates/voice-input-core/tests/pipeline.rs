@@ -159,6 +159,53 @@ fn cancellation_discards_the_recording_and_returns_to_idle() {
 
     assert_eq!(coordinator.state(), SessionState::Idle);
     assert!(coordinator.current_context().is_none());
+
+    coordinator
+        .start_recording(&RecordingOptions::default())
+        .expect("a cancelled recording must be reusable");
+    coordinator
+        .stop_and_send(
+            &TranscriptionOptions::default(),
+            &ProcessingContext::default(),
+            &CancellationToken::new(),
+        )
+        .expect("the session must be reusable after recording cancellation");
+    assert_eq!(coordinator.state(), SessionState::Idle);
+}
+
+#[test]
+fn cancelled_transcription_clears_session_before_reuse() {
+    let mut coordinator = coordinator(RecordingSink::default());
+    let cancel = CancellationToken::new();
+
+    coordinator
+        .start_recording(&RecordingOptions::default())
+        .expect("recording must start");
+    cancel.cancel();
+
+    let error = coordinator
+        .stop_and_send(
+            &TranscriptionOptions::default(),
+            &ProcessingContext::default(),
+            &cancel,
+        )
+        .expect_err("cancelled transcription must return a cancellation error");
+
+    assert_eq!(error, AppError::Cancelled);
+    assert_eq!(coordinator.state(), SessionState::Idle);
+    assert!(coordinator.current_context().is_none());
+
+    coordinator
+        .start_recording(&RecordingOptions::default())
+        .expect("a cancelled transcription must be reusable");
+    coordinator
+        .stop_and_send(
+            &TranscriptionOptions::default(),
+            &ProcessingContext::default(),
+            &CancellationToken::new(),
+        )
+        .expect("the session must be reusable after transcription cancellation");
+    assert_eq!(coordinator.state(), SessionState::Idle);
 }
 
 #[test]

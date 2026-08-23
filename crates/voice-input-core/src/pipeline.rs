@@ -78,6 +78,9 @@ impl SessionCoordinator {
         let audio = match self.recorder.stop() {
             Ok(audio) => audio,
             Err(error) => {
+                if cancel.is_cancelled() {
+                    return self.cancelled();
+                }
                 self.state = SessionState::Failed;
                 return Err(error.into());
             }
@@ -90,41 +93,37 @@ impl SessionCoordinator {
         {
             Ok(transcript) => transcript,
             Err(error) => {
-                self.state = if cancel.is_cancelled() {
-                    SessionState::Idle
-                } else {
-                    SessionState::Failed
-                };
-                return if cancel.is_cancelled() {
-                    Err(AppError::Cancelled)
-                } else {
-                    Err(error.into())
-                };
+                if cancel.is_cancelled() {
+                    return self.cancelled();
+                }
+                self.state = SessionState::Failed;
+                return Err(error.into());
             }
         };
 
         if cancel.is_cancelled() {
-            self.clear_session();
-            return Err(AppError::Cancelled);
+            return self.cancelled();
         }
 
         self.state = SessionState::PostProcessing;
         let processed = match self.post_processor.process(transcript, processing_context) {
             Ok(processed) => processed,
             Err(error) => {
+                if cancel.is_cancelled() {
+                    return self.cancelled();
+                }
                 self.state = SessionState::Failed;
                 return Err(error.into());
             }
         };
 
+        if cancel.is_cancelled() {
+            return self.cancelled();
+        }
+
         if processed.text.is_empty() {
             self.state = SessionState::Failed;
             return Err(AppError::EmptyTranscript);
-        }
-
-        if cancel.is_cancelled() {
-            self.clear_session();
-            return Err(AppError::Cancelled);
         }
 
         self.state = SessionState::Sending;
@@ -135,10 +134,17 @@ impl SessionCoordinator {
         let receipt = match self.sink.send(&processed, context) {
             Ok(receipt) => receipt,
             Err(error) => {
+                if cancel.is_cancelled() {
+                    return self.cancelled();
+                }
                 self.state = SessionState::Failed;
                 return Err(error.into());
             }
         };
+
+        if cancel.is_cancelled() {
+            return self.cancelled();
+        }
 
         self.state = SessionState::Completed;
         self.clear_session();
@@ -166,6 +172,11 @@ impl SessionCoordinator {
                 actual: self.state,
             })
         }
+    }
+
+    fn cancelled<T>(&mut self) -> Result<T, AppError> {
+        self.clear_session();
+        Err(AppError::Cancelled)
     }
 
     fn clear_session(&mut self) {

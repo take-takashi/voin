@@ -162,7 +162,7 @@ fn timestamp_to_duration(timestamp_centiseconds: i64) -> Duration {
 mod tests {
     use super::{default_thread_count, timestamp_to_duration, WhisperTranscriber};
     use std::time::Duration;
-    use voice_input_core::LanguageMode;
+    use voice_input_core::{CancellationToken, LanguageMode};
 
     #[test]
     fn default_thread_count_is_positive_and_bounded() {
@@ -191,5 +191,15 @@ mod tests {
             WhisperTranscriber::language_option(&LanguageMode::English),
             "en"
         );
+    }
+
+    #[test]
+    fn abort_callback_tracks_the_shared_token_state() {
+        let cancel = CancellationToken::new();
+        let user_data = &cancel as *const CancellationToken as *mut std::ffi::c_void;
+
+        assert!(!unsafe { super::abort_callback(user_data) });
+        cancel.cancel();
+        assert!(unsafe { super::abort_callback(user_data) });
     }
 }
