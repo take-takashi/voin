@@ -1,0 +1,8 @@
+[package]
+name = "voice-input-sinks"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arboard = "3.6.1"
+voice-input-core = { path = "../voice-input-core" }

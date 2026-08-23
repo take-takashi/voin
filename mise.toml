@@ -1,0 +1,118 @@
+[tools]
+rust = "1.91.1"
+cmake = "4.4.2"
+
+[tasks.fmt]
+description = "Rustコードをフォーマットする"
+run = "cargo fmt --all"
+
+[tasks.check]
+description = "ワークスペースを型チェックする"
+run = "cargo check --workspace"
+
+[tasks.test]
+description = "ワークスペースのテストを実行する"
+run = "cargo test --workspace"
+
+[tasks.ci]
+description = "フォーマット、型チェック、テストを実行する"
+depends = ["fmt", "check", "test"]
+
+[tasks.build]
+description = "Release用のvoin-cliバイナリをビルドする"
+run = "cargo build --release -p voin-cli --bin voin-cli"
+
+[tasks.model-download]
+description = "Whisperモデルをmodels/へダウンロードする"
+usage = '''
+arg "[model]" help="ダウンロードするモデル" default="base" {
+  choices "base" "small"
+}
+'''
+run = '''
+set -eu
+model_name="${usage_model:-base}"
+model_dir="{{config_root}}/models"
+model_path="$model_dir/ggml-${model_name}.bin"
+partial_path="$model_path.part"
+model_url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${model_name}.bin"
+
+mkdir -p "$model_dir"
+if [ -s "$model_path" ]; then
+    echo "Whisperモデルは既に存在します: $model_path"
+    exit 0
+fi
+
+echo "Whisperモデルをダウンロードします: $model_path"
+curl --fail --location --retry 5 --retry-delay 5 --output "$partial_path" "$model_url"
+mv "$partial_path" "$model_path"
+echo "Whisperモデルを保存しました: $model_path"
+'''
+
+[tasks.model-check]
+description = "models/のWhisperモデルを確認する"
+usage = '''
+arg "[model]" help="確認するモデル" default="base" {
+  choices "base" "small"
+}
+'''
+run = '''
+set -eu
+model_name="${usage_model:-base}"
+model_path="{{config_root}}/models/ggml-${model_name}.bin"
+
+if [ ! -s "$model_path" ]; then
+    echo "Whisperモデルがありません: $model_path" >&2
+    echo "先に mise run model-download -- $model_name を実行してください。" >&2
+    exit 1
+fi
+
+echo "Whisperモデルを確認しました: $model_path"
+'''
+
+[tasks.record]
+description = "マイクから録音してrecordings/へ保存する"
+usage = '''
+flag "--duration <seconds>" help="録音時間（秒）" default="5"
+flag "--output <path>" help="保存先WAVファイル" default="recordings/voin.wav"
+'''
+run = '''
+set -eu
+output="${usage_output:-recordings/voin.wav}"
+duration="${usage_duration:-5}"
+mkdir -p "$(dirname "$output")"
+cargo run -p voin-cli --bin voin-cli -- record --output "$output" --duration "$duration"
+'''
+
+[tasks.transcribe]
+description = "recordings/のWAVをWhisperで文字起こしする"
+usage = '''
+flag "--input <path>" help="入力WAVファイル" default="recordings/voin.wav"
+flag "--model <path>" help="Whisperモデルファイル" default="models/ggml-base.bin"
+flag "--sink <sink>" help="出力先" default="stdout" {
+  choices "stdout" "clipboard"
+}
+flag "--format <format>" help="stdoutの形式" default="plain" {
+  choices "plain" "json"
+}
+'''
+run = '''
+set -eu
+input="${usage_input:-recordings/voin.wav}"
+model="${usage_model:-models/ggml-base.bin}"
+sink="${usage_sink:-stdout}"
+format="${usage_format:-plain}"
+cargo run -p voin-cli --bin voin-cli -- transcribe \
+  --input "$input" \
+  --model "$model" \
+  --sink "$sink" \
+  --format "$format"
+'''
+
+[tasks.doctor]
+description = "音声入力環境を診断する"
+run = "cargo run -p voin-cli --bin voin-cli -- doctor"
+
+[tasks.devices]
+description = "入力デバイスを列挙する"
+run = "cargo run -p voin-cli --bin voin-cli -- devices list"

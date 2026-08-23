@@ -1,0 +1,8 @@
+[package]
+name = "voice-input-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Cross-platform core pipeline for local voice input"
+
+[dependencies]

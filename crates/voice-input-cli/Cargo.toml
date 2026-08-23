@@ -1,0 +1,19 @@
+[package]
+name = "voin-cli"
+version = "0.1.0"
+edition = "2021"
+
+autobins = false
+
+[[bin]]
+name = "voin-cli"
+path = "src/main.rs"
+
+[dependencies]
+ctrlc = "3.5.2"
+hound = "3.5.1"
+tempfile = "3.27.0"
+voice-input-core = { path = "../voice-input-core" }
+voice-input-recorder-cpal = { path = "../voice-input-recorder-cpal" }
+voice-input-sinks = { path = "../voice-input-sinks" }
+voice-input-transcriber-whisper = { path = "../voice-input-transcriber-whisper" }
