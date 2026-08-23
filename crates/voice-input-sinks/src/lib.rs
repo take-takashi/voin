@@ -35,7 +35,13 @@ impl<W: Write + Send> StdoutSink<W> {
 
     fn render(&self, text: &ProcessedText, context: &OutputContext) -> String {
         match self.format {
-            OutputFormat::Plain => format!("{}\n", text.text),
+            OutputFormat::Plain => {
+                if text.text.ends_with('\n') {
+                    text.text.clone()
+                } else {
+                    format!("{}\n", text.text)
+                }
+            }
             OutputFormat::Json => {
                 let language = text
                     .source
@@ -168,6 +174,21 @@ mod tests {
     fn writes_plain_text_with_a_trailing_newline() {
         let sink = StdoutSink::with_writer(OutputFormat::Plain, Vec::new());
         sink.send(&sample_text(), &OutputContext::new("session-1"))
+            .expect("plain output must succeed");
+
+        assert_eq!(
+            sink.into_writer().expect("writer must be available"),
+            b"hello \"voin\"\n"
+        );
+    }
+
+    #[test]
+    fn does_not_add_a_second_trailing_newline() {
+        let sink = StdoutSink::with_writer(OutputFormat::Plain, Vec::new());
+        let mut text = sample_text();
+        text.text.push('\n');
+
+        sink.send(&text, &OutputContext::new("session-1"))
             .expect("plain output must succeed");
 
         assert_eq!(

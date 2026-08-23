@@ -142,10 +142,6 @@ impl SessionCoordinator {
             }
         };
 
-        if cancel.is_cancelled() {
-            return self.cancelled();
-        }
-
         self.state = SessionState::Completed;
         self.clear_session();
         Ok(receipt)

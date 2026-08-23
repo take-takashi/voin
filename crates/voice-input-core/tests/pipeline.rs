@@ -209,6 +209,56 @@ fn cancelled_transcription_clears_session_before_reuse() {
 }
 
 #[test]
+fn successful_output_is_not_cancelled_after_sink_sends() {
+    struct CancellingSink {
+        cancel: CancellationToken,
+    }
+
+    impl TextSink for CancellingSink {
+        fn send(
+            &self,
+            _text: &ProcessedText,
+            _context: &OutputContext,
+        ) -> Result<SendReceipt, SinkError> {
+            self.cancel.cancel();
+            Ok(SendReceipt {
+                sink_name: "test".to_owned(),
+                bytes_sent: 1,
+                pasted: false,
+            })
+        }
+    }
+
+    let cancel = CancellationToken::new();
+    let mut coordinator = SessionCoordinator::new(
+        Box::new(DummyRecorder {
+            started: false,
+            cancelled: false,
+        }),
+        Box::new(DummyTranscriber),
+        Box::new(DeterministicPostProcessor),
+        Box::new(CancellingSink {
+            cancel: cancel.clone(),
+        }),
+    );
+
+    coordinator
+        .start_recording(&RecordingOptions::default())
+        .expect("recording must start");
+    let receipt = coordinator
+        .stop_and_send(
+            &TranscriptionOptions::default(),
+            &ProcessingContext::default(),
+            &cancel,
+        )
+        .expect("a successful send must remain successful");
+
+    assert_eq!(receipt.sink_name, "test");
+    assert_eq!(coordinator.state(), SessionState::Idle);
+    assert!(coordinator.current_context().is_none());
+}
+
+#[test]
 fn empty_processed_text_is_not_sent() {
     struct EmptyTranscriber;
 

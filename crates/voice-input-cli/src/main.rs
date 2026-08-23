@@ -1,11 +1,11 @@
 use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use hound::{SampleFormat as WavSampleFormat, WavReader, WavSpec, WavWriter};
+use tempfile::Builder;
 use voice_input_core::{
     AudioBuffer, CancellationToken, DeterministicPostProcessor, LanguageMode, OutputContext,
     OutputFormat, PostProcessor, ProcessingContext, Recorder, RecordingOptions, TextSink,
@@ -211,84 +211,61 @@ fn transcribe_command(args: &[String]) -> Result<(), String> {
         _ => return Err("--sink must be stdout or clipboard".to_owned()),
     };
 
-    if cancel.is_cancelled() {
-        return Err("operation cancelled".to_owned());
-    }
     send_result?;
     Ok(())
 }
 
 fn write_wav(path: &str, audio: &AudioBuffer, cancel: &CancellationToken) -> Result<(), String> {
     let output_path = Path::new(path);
-    let mut temporary = TemporaryOutput::new(temporary_output_path(output_path));
     if cancel.is_cancelled() {
         return Err("operation cancelled".to_owned());
     }
+
+    let parent = output_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let prefix = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!(".{name}."))
+        .unwrap_or_else(|| ".voin-output.".to_owned());
+    let mut temporary = Builder::new()
+        .prefix(&prefix)
+        .suffix(".part")
+        .tempfile_in(parent)
+        .map_err(|error| format!("failed to create temporary WAV: {error}"))?;
     let spec = WavSpec {
         channels: 1,
         sample_rate: audio.sample_rate_hz,
         bits_per_sample: 16,
         sample_format: WavSampleFormat::Int,
     };
-    let mut writer = WavWriter::create(temporary.path(), spec)
-        .map_err(|error| format!("failed to create temporary WAV: {error}"))?;
 
-    for sample in &audio.samples {
-        if cancel.is_cancelled() {
-            return Err("operation cancelled".to_owned());
+    {
+        let mut writer = WavWriter::new(temporary.as_file_mut(), spec)
+            .map_err(|error| format!("failed to create temporary WAV: {error}"))?;
+        for sample in &audio.samples {
+            if cancel.is_cancelled() {
+                return Err("operation cancelled".to_owned());
+            }
+            let sample = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
+            writer
+                .write_sample(sample)
+                .map_err(|error| format!("failed to write WAV: {error}"))?;
         }
-        let sample = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16;
         writer
-            .write_sample(sample)
-            .map_err(|error| format!("failed to write WAV: {error}"))?;
+            .finalize()
+            .map_err(|error| format!("failed to finalize WAV: {error}"))?;
     }
-    writer
-        .finalize()
-        .map_err(|error| format!("failed to finalize WAV: {error}"))?;
 
     if cancel.is_cancelled() {
         return Err("operation cancelled".to_owned());
     }
-    fs::rename(temporary.path(), output_path)
-        .map_err(|error| format!("failed to move WAV into place: {error}"))?;
-    temporary.commit();
+    temporary
+        .persist(output_path)
+        .map_err(|error| format!("failed to move WAV into place: {}", error.error))?;
     Ok(())
-}
-
-struct TemporaryOutput {
-    path: Option<PathBuf>,
-}
-
-impl TemporaryOutput {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-
-    fn path(&self) -> &Path {
-        self.path
-            .as_deref()
-            .expect("temporary output path must be available")
-    }
-
-    fn commit(&mut self) {
-        self.path = None;
-    }
-}
-
-impl Drop for TemporaryOutput {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
-fn temporary_output_path(output: &Path) -> PathBuf {
-    let name = output
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("voin-output");
-    output.with_file_name(format!(".{name}.{}.part", std::process::id()))
 }
 
 fn read_wav(path: &str, cancel: &CancellationToken) -> Result<AudioBuffer, String> {
@@ -374,8 +351,7 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use super::{temporary_output_path, write_wav};
-    use std::fs;
+    use super::write_wav;
     use voice_input_core::{AudioBuffer, CancellationToken};
 
     #[test]
@@ -385,9 +361,7 @@ mod tests {
             std::process::id(),
             "test"
         ));
-        let temporary = temporary_output_path(&output);
-        let _ = fs::remove_file(&output);
-        let _ = fs::remove_file(&temporary);
+        let _ = std::fs::remove_file(&output);
 
         let audio = AudioBuffer::new(vec![0.0; 16_000], 16_000, 1);
         let cancel = CancellationToken::new();
@@ -398,6 +372,5 @@ mod tests {
 
         assert_eq!(error, "operation cancelled");
         assert!(!output.exists());
-        assert!(!temporary.exists());
     }
 }
