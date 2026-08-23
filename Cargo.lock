@@ -1156,17 +1156,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
-name = "voice-input-cli"
-version = "0.1.0"
-dependencies = [
- "hound",
- "voice-input-core",
- "voice-input-recorder-cpal",
- "voice-input-sinks",
- "voice-input-transcriber-whisper",
-]
-
-[[package]]
 name = "voice-input-core"
 version = "0.1.0"
 
@@ -1192,6 +1181,17 @@ version = "0.1.0"
 dependencies = [
  "voice-input-core",
  "whisper-rs",
+]
+
+[[package]]
+name = "voin-cli"
+version = "0.1.0"
+dependencies = [
+ "hound",
+ "voice-input-core",
+ "voice-input-recorder-cpal",
+ "voice-input-sinks",
+ "voice-input-transcriber-whisper",
 ]
 
 [[package]]

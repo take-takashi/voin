@@ -17,6 +17,11 @@ run = "cargo test --workspace"
 [tasks.ci]
 description = "フォーマット、型チェック、テストを実行する"
 depends = ["fmt", "check", "test"]
+
+[tasks.build]
+description = "Release用のvoin-cliバイナリをビルドする"
+run = "cargo build --release -p voin-cli --bin voin-cli"
+
 [tasks.model-download]
 description = "Whisperモデルをmodels/へダウンロードする"
 usage = '''
@@ -76,7 +81,7 @@ set -eu
 output="${usage_output:-recordings/voin.wav}"
 duration="${usage_duration:-5}"
 mkdir -p "$(dirname "$output")"
-cargo run -p voice-input-cli -- record --output "$output" --duration "$duration"
+cargo run -p voin-cli --bin voin-cli -- record --output "$output" --duration "$duration"
 '''
 
 [tasks.transcribe]
@@ -97,7 +102,7 @@ input="${usage_input:-recordings/voin.wav}"
 model="${usage_model:-models/ggml-base.bin}"
 sink="${usage_sink:-stdout}"
 format="${usage_format:-plain}"
-cargo run -p voice-input-cli -- transcribe \
+cargo run -p voin-cli --bin voin-cli -- transcribe \
   --input "$input" \
   --model "$model" \
   --sink "$sink" \
@@ -106,8 +111,8 @@ cargo run -p voice-input-cli -- transcribe \
 
 [tasks.doctor]
 description = "音声入力環境を診断する"
-run = "cargo run -p voice-input-cli -- doctor"
+run = "cargo run -p voin-cli --bin voin-cli -- doctor"
 
 [tasks.devices]
 description = "入力デバイスを列挙する"
-run = "cargo run -p voice-input-cli -- devices list"
+run = "cargo run -p voin-cli --bin voin-cli -- devices list"

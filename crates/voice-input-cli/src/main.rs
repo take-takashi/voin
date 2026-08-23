@@ -233,13 +233,13 @@ fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 }
 
 fn print_help() {
-    println!("voin - local Japanese voice input");
+    println!("voin-cli - local Japanese voice input");
     println!();
     println!("Usage:");
-    println!("  voin doctor");
-    println!("  voin devices list");
-    println!("  voin record --output /tmp/voice.wav [--duration 5]");
+    println!("  voin-cli doctor");
+    println!("  voin-cli devices list");
+    println!("  voin-cli record --output /tmp/voice.wav [--duration 5]");
     println!(
-        "  voin transcribe --input /tmp/voice.wav --model /path/to/model.bin [--sink stdout|clipboard] [--format plain|json]"
+        "  voin-cli transcribe --input /tmp/voice.wav --model /path/to/model.bin [--sink stdout|clipboard] [--format plain|json]"
     );
 }

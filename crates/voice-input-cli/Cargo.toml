@@ -1,7 +1,13 @@
 [package]
-name = "voice-input-cli"
+name = "voin-cli"
 version = "0.1.0"
 edition = "2021"
+
+autobins = false
+
+[[bin]]
+name = "voin-cli"
+path = "src/main.rs"
 
 [dependencies]
 hound = "3.5.1"
