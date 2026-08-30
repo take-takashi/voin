@@ -117,7 +117,7 @@ run = "cargo run -p voin-cli --bin voin-cli -- doctor"
 description = "入力デバイスを列挙する"
 run = "cargo run -p voin-cli --bin voin-cli -- devices list"
 
-[tasks.agent-daemon]
+[tasks."agent:daemon"]
 description = "音声入力エージェントを常駐起動する"
 usage = '''
 flag "--model <path>" help="Whisperモデルファイル" default="models/ggml-base.bin"
@@ -134,7 +134,7 @@ fi
 
 if [ ! -s "$model" ]; then
     echo "Whisperモデルがありません: $model" >&2
-    echo "例: mise run agent-daemon -- --model /path/to/model.bin" >&2
+    echo "例: mise run agent:daemon -- --model /path/to/model.bin" >&2
     exit 1
 fi
 
@@ -143,7 +143,7 @@ cargo run -p voin-cli --bin voin-cli -- agent daemon \
   --endpoint "$endpoint"
 '''
 
-[tasks.agent-toggle]
+[tasks."agent:toggle"]
 description = "録音の開始と停止をトグルする"
 usage = '''
 flag "--endpoint <endpoint>" help="エージェントの接続先" default="127.0.0.1:38741"
@@ -154,7 +154,7 @@ endpoint="${usage_endpoint:-127.0.0.1:38741}"
 cargo run -p voin-cli --bin voin-cli -- agent toggle --endpoint "$endpoint"
 '''
 
-[tasks.agent-status]
+[tasks."agent:status"]
 description = "音声入力エージェントの状態を確認する"
 usage = '''
 flag "--endpoint <endpoint>" help="エージェントの接続先" default="127.0.0.1:38741"
@@ -165,7 +165,7 @@ endpoint="${usage_endpoint:-127.0.0.1:38741}"
 cargo run -p voin-cli --bin voin-cli -- agent status --endpoint "$endpoint"
 '''
 
-[tasks.agent-reset]
+[tasks."agent:reset"]
 description = "失敗状態の音声入力エージェントをリセットする"
 usage = '''
 flag "--endpoint <endpoint>" help="エージェントの接続先" default="127.0.0.1:38741"
@@ -176,7 +176,7 @@ endpoint="${usage_endpoint:-127.0.0.1:38741}"
 cargo run -p voin-cli --bin voin-cli -- agent reset --endpoint "$endpoint"
 '''
 
-[tasks.agent-shutdown]
+[tasks."agent:shutdown"]
 description = "音声入力エージェントを終了する"
 usage = '''
 flag "--endpoint <endpoint>" help="エージェントの接続先" default="127.0.0.1:38741"
