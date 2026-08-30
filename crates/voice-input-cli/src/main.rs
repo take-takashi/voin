@@ -1,3 +1,5 @@
+mod agent;
+
 use std::env;
 use std::path::Path;
 use std::process::ExitCode;
@@ -42,6 +44,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "doctor" if args.len() == 1 => doctor(),
         "record" => record_command(&args),
         "transcribe" => transcribe_command(&args),
+        "agent" => agent::command(&args),
         _ => {
             print_help();
             Err("unknown command".to_owned())
@@ -347,6 +350,8 @@ fn print_help() {
     println!(
         "  voin-cli transcribe --input /tmp/voice.wav --model /path/to/model.bin [--sink stdout|clipboard] [--format plain|json]"
     );
+    println!("  voin-cli agent daemon --model /path/to/model.bin [--endpoint 127.0.0.1:38741]");
+    println!("  voin-cli agent start|stop|toggle|cancel|status|reset|shutdown [--endpoint 127.0.0.1:38741]");
 }
 
 #[cfg(test)]

@@ -42,6 +42,7 @@ MVPでは、次の処理をクロスプラットフォームの共通パイプ�
 - `devices list` コマンド
 - 音声ファイルを使う `transcribe` コマンド
 - マイクを使う単発の録音・文字起こし
+- `agent`コマンドによるtoggle方式の常駐プロセス
 - 構造化ログ
 - コアとアダプターのユニットテスト
 - macOS、Windows、Linuxでのビルド確認
@@ -57,7 +58,6 @@ MVPでは、次の処理をクロスプラットフォームの共通パイプ�
 - Herdrへの送信
 - 常駐GUI
 - push-to-talk
-- IPCデーモン
 - モデルの自動ダウンロード
 - GPUバックエンド
 - リアルタイム文字起こし
@@ -69,14 +69,57 @@ MVPでは、次の処理をクロスプラットフォームの共通パイプ�
 共通コアは、OS、録音ライブラリ、Whisper.cpp、GUI、外部コマンドへ直接依存しません。
 
 ```text
-CLI / GUI
-    ↓ 組み立て
-SessionCoordinator
+CLI / GUI / 外部トリガー
+    ↓ 共通コマンド
+アプリケーション層（将来のvoin-agent）
+    ↓ セッション操作
+SessionCoordinator（コア層）
     ↓ trait
 Recorder → Transcriber → PostProcessor → TextSink
     ↓          ↓              ↓              ↓
 CPAL     whisper.cpp       共通処理       stdout / clipboard
 ```
+
+### コア層
+
+コア層は、OSに依存しない音声入力の処理を担当します。
+
+- 音声入力セッションの状態管理
+- 録音、文字起こし、後処理、出力の実行
+- キャンセルとエラーの伝播
+- `Recorder`、`Transcriber`、`PostProcessor`、`TextSink`のtrait
+
+コア層は、操作手段、IPC、GUI、OS固有のAPIを知りません。
+
+### アプリケーション層
+
+アプリケーション層は、コア層を組み立てて実行します。
+
+常駐プロセスは、次の責務を持ちます。
+
+- コア層の依存オブジェクトを生成する
+- `start`、`stop`、`toggle`、`cancel`、`status`を受け付ける
+- 常駐中のセッション状態を管理する
+- IPC経由で操作インターフェースへ結果を返す
+
+常駐プロセスは、操作手段に依存しません。
+
+### インターフェース層
+
+インターフェース層は、利用者の操作を共通コマンドへ変換します。
+
+初期の候補は、次のとおりです。
+
+- CLI
+- 外部ランチャーや自動化ツール
+- OS別のグローバルホットキー
+- 将来のGUIやメニューバーアプリ
+
+外部トリガーは、グローバルホットキーの入口として利用できます。
+
+初期実装では、常駐プロセスと操作インターフェースの通信にlocalhost TCPを使います。
+通信方式は、将来OS別アダプターへ差し替えられる境界に置きます。
+通信プロトコルは、OSに依存しない共通コマンドとして設計します。
 
 ### 共通コアの責務
 
@@ -107,10 +150,16 @@ CPAL     whisper.cpp       共通処理       stdout / clipboard
 | `Transcriber` | `WhisperCppTranscriber` | 別のローカルモデル、外部API |
 | `PostProcessor` | 決定的な標準処理 | LLM処理、ユーザー拡張 |
 | `TextSink` | `StdoutSink`、`ClipboardSink` | `TmuxSink`、`HerdrSink`、paste |
-| `HotkeySource` | CLI操作、toggle | OSごとのグローバルホットキー |
+| `CommandSource` | CLI操作 | 外部ランチャー、自動化ツール、OSごとのグローバルホットキー、GUI |
 
 OSごとに提供できる機能が異なる場合は、共通traitで無理に同じ動作を保証しません。
-利用可能な機能を診断結果として示し、SinkやHotkeySourceのアダプターで扱います。
+利用可能な機能を診断結果として示し、SinkやCommandSourceのアダプターで扱います。
+
+`CommandSource`は、利用者の操作を共通コマンドへ変換します。
+外部ランチャー固有の実装やOS固有のホットキーAPIは、コア層へ追加しません。
+
+常駐プロセスとIPCは、`voin-cli agent`として実装します。
+`start`、`stop`、`toggle`、`cancel`、`status`、`reset`を共通コマンドとして受け付けます。
 
 ## データ境界
 
