@@ -1,6 +1,7 @@
 use std::fmt::Display;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -13,6 +14,10 @@ use voice_input_sinks::ClipboardSink;
 use voice_input_transcriber_whisper::WhisperTranscriber;
 
 pub const DEFAULT_ENDPOINT: &str = "127.0.0.1:38741";
+
+const MAX_COMMAND_BYTES: usize = 128;
+const COMMAND_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const COMMAND_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentCommand {
@@ -80,21 +85,14 @@ impl AgentRuntime {
 
     pub fn handle(&mut self, command: AgentCommand) -> Result<AgentReply, AppError> {
         match command {
-            AgentCommand::Start => {
-                self.coordinator.start_recording(&self.recording_options)?;
-                Ok(AgentReply::State(self.coordinator.state()))
-            }
+            AgentCommand::Start => self.start_recording(),
             AgentCommand::Stop => self.stop_and_send(),
             AgentCommand::Toggle => match self.coordinator.state() {
-                SessionState::Idle => {
-                    self.coordinator.start_recording(&self.recording_options)?;
-                    Ok(AgentReply::State(self.coordinator.state()))
-                }
+                SessionState::Idle => self.start_recording(),
                 SessionState::Recording => self.stop_and_send(),
                 SessionState::Failed => {
                     self.coordinator.reset()?;
-                    self.coordinator.start_recording(&self.recording_options)?;
-                    Ok(AgentReply::State(self.coordinator.state()))
+                    self.start_recording()
                 }
                 actual => Err(AppError::InvalidState {
                     expected: SessionState::Idle,
@@ -114,6 +112,12 @@ impl AgentRuntime {
         }
     }
 
+    fn start_recording(&mut self) -> Result<AgentReply, AppError> {
+        self.operation_cancel.reset();
+        self.coordinator.start_recording(&self.recording_options)?;
+        Ok(AgentReply::State(self.coordinator.state()))
+    }
+
     fn stop_and_send(&mut self) -> Result<AgentReply, AppError> {
         let receipt = self.coordinator.stop_and_send(
             &self.transcription_options,
@@ -122,6 +126,40 @@ impl AgentRuntime {
         )?;
         Ok(AgentReply::Completed(receipt))
     }
+}
+
+struct AgentRequest {
+    command: AgentCommand,
+    response: mpsc::Sender<String>,
+}
+
+struct SharedAgentState {
+    state: Mutex<SessionState>,
+    operation_cancel: CancellationToken,
+    shutdown: CancellationToken,
+}
+
+impl SharedAgentState {
+    fn new(runtime: &AgentRuntime, shutdown: &CancellationToken) -> Self {
+        Self {
+            state: Mutex::new(runtime.state()),
+            operation_cancel: runtime.operation_cancel.clone(),
+            shutdown: shutdown.clone(),
+        }
+    }
+
+    fn set_state(&self, state: SessionState) -> io::Result<()> {
+        *self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("agent state mutex is poisoned"))? = state;
+        Ok(())
+    }
+}
+
+enum CommandDispatch {
+    Queue(AgentCommand),
+    Respond(String),
 }
 
 pub fn command(args: &[String]) -> Result<(), String> {
@@ -142,10 +180,90 @@ pub fn command(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn reserve_command(
+    command: AgentCommand,
+    shared: &SharedAgentState,
+) -> Result<CommandDispatch, String> {
+    let mut state = shared
+        .state
+        .lock()
+        .map_err(|_| "agent state mutex is poisoned".to_owned())?;
+
+    match command {
+        AgentCommand::Status => Ok(CommandDispatch::Respond(format!(
+            "OK state={}",
+            state_name(*state)
+        ))),
+        AgentCommand::Shutdown => {
+            shared.operation_cancel.cancel();
+            shared.shutdown.cancel();
+            Ok(CommandDispatch::Respond("OK shutdown".to_owned()))
+        }
+        AgentCommand::Start => {
+            require_state(*state, SessionState::Idle)?;
+            *state = SessionState::Recording;
+            Ok(CommandDispatch::Queue(AgentCommand::Start))
+        }
+        AgentCommand::Stop => {
+            require_state(*state, SessionState::Recording)?;
+            *state = SessionState::Transcribing;
+            Ok(CommandDispatch::Queue(AgentCommand::Stop))
+        }
+        AgentCommand::Toggle => match *state {
+            SessionState::Idle => {
+                *state = SessionState::Recording;
+                Ok(CommandDispatch::Queue(AgentCommand::Start))
+            }
+            SessionState::Recording => {
+                *state = SessionState::Transcribing;
+                Ok(CommandDispatch::Queue(AgentCommand::Stop))
+            }
+            SessionState::Failed => {
+                *state = SessionState::Recording;
+                Ok(CommandDispatch::Queue(AgentCommand::Toggle))
+            }
+            actual => Err(busy_state_error(actual)),
+        },
+        AgentCommand::Cancel => match *state {
+            SessionState::Recording => {
+                *state = SessionState::Idle;
+                Ok(CommandDispatch::Queue(AgentCommand::Cancel))
+            }
+            SessionState::Transcribing | SessionState::PostProcessing | SessionState::Sending => {
+                shared.operation_cancel.cancel();
+                Ok(CommandDispatch::Respond("OK cancel requested".to_owned()))
+            }
+            actual => Err(invalid_state_error(SessionState::Recording, actual)),
+        },
+        AgentCommand::Reset => {
+            require_state(*state, SessionState::Failed)?;
+            *state = SessionState::Idle;
+            Ok(CommandDispatch::Queue(AgentCommand::Reset))
+        }
+    }
+}
+
+fn require_state(actual: SessionState, expected: SessionState) -> Result<(), String> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(invalid_state_error(expected, actual))
+    }
+}
+
+fn invalid_state_error(expected: SessionState, actual: SessionState) -> String {
+    format!("invalid session state: expected {expected:?}, got {actual:?}")
+}
+
+fn busy_state_error(actual: SessionState) -> String {
+    format!("agent is busy: state={}", state_name(actual))
+}
+
 fn daemon_command(args: &[String]) -> Result<(), String> {
     let model = required_flag(args, "--model")?;
     let endpoint = flag_value(args, "--endpoint").unwrap_or(DEFAULT_ENDPOINT);
     let shutdown = install_shutdown_handler()?;
+    let operation_cancel = CancellationToken::new();
     let transcriber = WhisperTranscriber::from_model_path(model)
         .map_err(|error| format!("failed to initialize transcriber: {error}"))?;
     let sink = ClipboardSink::new()
@@ -156,15 +274,15 @@ fn daemon_command(args: &[String]) -> Result<(), String> {
         Box::new(DeterministicPostProcessor),
         Box::new(sink),
     );
-    let mut runtime = AgentRuntime::new(
+    let runtime = AgentRuntime::new(
         coordinator,
         RecordingOptions::default(),
         TranscriptionOptions::default(),
         ProcessingContext::default(),
-        shutdown.clone(),
+        operation_cancel,
     );
 
-    run_server(endpoint, &mut runtime, &shutdown)
+    run_server(endpoint, runtime, &shutdown)
         .map_err(|error| format!("agent server failed: {error}"))
 }
 
@@ -178,62 +296,169 @@ fn client_command(action: &str, args: &[String]) -> Result<(), String> {
 
 pub fn run_server(
     endpoint: &str,
-    runtime: &mut AgentRuntime,
+    runtime: AgentRuntime,
     shutdown: &CancellationToken,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(endpoint)?;
+    run_server_with_listener(listener, runtime, shutdown)
+}
+
+fn run_server_with_listener(
+    listener: TcpListener,
+    runtime: AgentRuntime,
+    shutdown: &CancellationToken,
+) -> io::Result<()> {
     listener.set_nonblocking(true)?;
-    eprintln!("voin agent listening on {endpoint}");
+    eprintln!("voin agent listening on {}", listener.local_addr()?);
+
+    let shared = Arc::new(SharedAgentState::new(&runtime, shutdown));
+    let (requests, receiver) = mpsc::channel();
+    let worker_shared = Arc::clone(&shared);
+    let worker = thread::spawn(move || worker_loop(runtime, receiver, worker_shared));
+    let mut connections = Vec::new();
 
     while !shutdown.is_cancelled() {
+        reap_finished_connections(&mut connections);
         match listener.accept() {
             Ok((stream, _address)) => {
-                let requested_shutdown = handle_connection(stream, runtime)?;
-                if requested_shutdown {
-                    shutdown.cancel();
-                }
+                let requests = requests.clone();
+                let shared = Arc::clone(&shared);
+                connections.push(thread::spawn(move || {
+                    if let Err(error) = handle_connection(stream, &requests, &shared) {
+                        eprintln!("agent connection failed: {error}");
+                    }
+                }));
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                shared.operation_cancel.cancel();
+                drop(requests);
+                for connection in connections {
+                    let _ = connection.join();
+                }
+                let _ = worker.join();
+                return Err(error);
+            }
         }
+    }
+
+    shared.operation_cancel.cancel();
+    drop(requests);
+    for connection in connections {
+        let _ = connection.join();
+    }
+    let _ = worker.join();
+    Ok(())
+}
+
+fn worker_loop(
+    mut runtime: AgentRuntime,
+    receiver: mpsc::Receiver<AgentRequest>,
+    shared: Arc<SharedAgentState>,
+) {
+    while let Ok(request) = receiver.recv() {
+        if shared.shutdown.is_cancelled() {
+            let _ = request
+                .response
+                .send("ERR agent is shutting down".to_owned());
+            continue;
+        }
+
+        let response = match runtime.handle(request.command) {
+            Ok(reply) => render_reply(reply),
+            Err(error) => format!("ERR {}", sanitize_message(error)),
+        };
+        if let Err(error) = shared.set_state(runtime.state()) {
+            eprintln!("failed to update agent state: {error}");
+        }
+        let _ = request.response.send(response);
     }
 
     if runtime.state() == SessionState::Recording {
         let _ = runtime.handle(AgentCommand::Cancel);
     }
-    Ok(())
+    if let Err(error) = shared.set_state(runtime.state()) {
+        eprintln!("failed to update agent state: {error}");
+    }
 }
 
-fn handle_connection(mut stream: TcpStream, runtime: &mut AgentRuntime) -> io::Result<bool> {
-    let mut line = String::new();
-    {
-        let mut reader = BufReader::new(&mut stream);
-        if reader.read_line(&mut line)? == 0 {
-            return Ok(false);
+fn reap_finished_connections(connections: &mut Vec<thread::JoinHandle<()>>) {
+    let mut active = Vec::with_capacity(connections.len());
+    for connection in connections.drain(..) {
+        if connection.is_finished() {
+            let _ = connection.join();
+        } else {
+            active.push(connection);
         }
     }
+    *connections = active;
+}
 
-    if line.len() > 128 {
-        write_response(&mut stream, "ERR command is too long")?;
-        return Ok(false);
-    }
+fn handle_connection(
+    mut stream: TcpStream,
+    requests: &mpsc::Sender<AgentRequest>,
+    shared: &SharedAgentState,
+) -> io::Result<()> {
+    stream.set_read_timeout(Some(COMMAND_READ_TIMEOUT))?;
+    stream.set_write_timeout(Some(COMMAND_WRITE_TIMEOUT))?;
 
+    let Some(line) = read_command_line(&mut stream)? else {
+        return Ok(());
+    };
     let command = match AgentCommand::parse(&line) {
         Ok(command) => command,
         Err(error) => {
             write_response(&mut stream, &format!("ERR {error}"))?;
-            return Ok(false);
+            return Ok(());
         }
     };
-    let requested_shutdown = command == AgentCommand::Shutdown;
-    let response = match runtime.handle(command) {
-        Ok(reply) => render_reply(reply),
-        Err(error) => format!("ERR {}", sanitize_message(error)),
-    };
-    write_response(&mut stream, &response)?;
-    Ok(requested_shutdown)
+
+    match reserve_command(command, shared) {
+        Ok(CommandDispatch::Respond(response)) => write_response(&mut stream, &response),
+        Ok(CommandDispatch::Queue(command)) => {
+            let (response, receiver) = mpsc::channel();
+            requests
+                .send(AgentRequest { command, response })
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "agent worker stopped"))?;
+            let response = receiver
+                .recv()
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "agent worker stopped"))?;
+            write_response(&mut stream, &response)
+        }
+        Err(error) => write_response(&mut stream, &format!("ERR {error}")),
+    }
+}
+
+fn read_command_line(stream: &mut TcpStream) -> io::Result<Option<String>> {
+    read_command_line_from(stream)
+}
+
+fn read_command_line_from(reader: &mut impl Read) -> io::Result<Option<String>> {
+    let mut bytes = Vec::with_capacity(MAX_COMMAND_BYTES);
+    loop {
+        let mut byte = [0_u8; 1];
+        match reader.read(&mut byte)? {
+            0 if bytes.is_empty() => return Ok(None),
+            0 => break,
+            1 if byte[0] == b'\n' => break,
+            1 => {
+                if bytes.len() >= MAX_COMMAND_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "command is too long",
+                    ));
+                }
+                bytes.push(byte[0]);
+            }
+            _ => unreachable!("a one-byte buffer cannot receive multiple bytes"),
+        }
+    }
+
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "command is not valid UTF-8"))
 }
 
 fn write_response(stream: &mut TcpStream, response: &str) -> io::Result<()> {
@@ -255,10 +480,9 @@ fn send_command(endpoint: &str, command: AgentCommand) -> Result<String, String>
         .flush()
         .map_err(|error| format!("failed to flush agent command: {error}"))?;
 
-    let mut response = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response)
-        .map_err(|error| format!("failed to read agent response: {error}"))?;
+    let response = read_command_line(&mut stream)
+        .map_err(|error| format!("failed to read agent response: {error}"))?
+        .ok_or_else(|| "agent closed the connection without a response".to_owned())?;
     let response = response.trim_end().to_owned();
     if let Some(error) = response.strip_prefix("ERR ") {
         return Err(error.to_owned());
@@ -332,7 +556,10 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::io::{Cursor, ErrorKind, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
 
     use super::{AgentCommand, AgentReply, AgentRuntime};
     use voice_input_core::{
@@ -388,6 +615,67 @@ mod tests {
         }
     }
 
+    struct BlockingTranscriber {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl Transcriber for BlockingTranscriber {
+        fn transcribe(
+            &self,
+            audio: &AudioBuffer,
+            _options: &TranscriptionOptions,
+            _cancel: &CancellationToken,
+        ) -> Result<Transcript, TranscriptionError> {
+            self.entered.wait();
+            self.release.wait();
+            Ok(Transcript {
+                text: "hello".to_owned(),
+                language: Some("en".to_owned()),
+                duration: audio.duration,
+                segments: Vec::new(),
+            })
+        }
+    }
+
+    struct TestServer {
+        endpoint: String,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn new(runtime: AgentRuntime) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
+            let endpoint = listener
+                .local_addr()
+                .expect("test listener must have an address")
+                .to_string();
+            let shutdown = CancellationToken::new();
+            let thread = thread::spawn(move || {
+                super::run_server_with_listener(listener, runtime, &shutdown)
+                    .expect("test server must run successfully");
+            });
+
+            Self {
+                endpoint,
+                thread: Some(thread),
+            }
+        }
+
+        fn send(&self, command: AgentCommand) -> Result<String, String> {
+            super::send_command(&self.endpoint, command)
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            let _ = self.send(AgentCommand::Shutdown);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("test server thread must exit");
+            }
+        }
+    }
+
     #[derive(Clone, Default)]
     struct RecordingSink {
         sent: Arc<Mutex<Vec<String>>>,
@@ -408,10 +696,10 @@ mod tests {
         }
     }
 
-    fn runtime() -> AgentRuntime {
+    fn runtime_with_transcriber(transcriber: Box<dyn Transcriber>) -> AgentRuntime {
         let coordinator = SessionCoordinator::new(
             Box::new(DummyRecorder { recording: false }),
-            Box::new(DummyTranscriber),
+            transcriber,
             Box::new(DeterministicPostProcessor),
             Box::new(RecordingSink::default()),
         );
@@ -422,6 +710,10 @@ mod tests {
             ProcessingContext::default(),
             CancellationToken::new(),
         )
+    }
+
+    fn runtime() -> AgentRuntime {
+        runtime_with_transcriber(Box::new(DummyTranscriber))
     }
 
     #[test]
@@ -477,6 +769,111 @@ mod tests {
             runtime.handle(AgentCommand::Toggle),
             Ok(AgentReply::State(SessionState::Recording))
         );
+    }
+
+    #[test]
+    fn command_reader_enforces_limit_without_newline() {
+        let mut input = Cursor::new(vec![b'x'; super::MAX_COMMAND_BYTES + 1]);
+        let error = super::read_command_line_from(&mut input)
+            .expect_err("an oversized command must be rejected");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "command is too long");
+    }
+
+    #[test]
+    fn command_reader_rejects_invalid_utf8() {
+        let mut input = Cursor::new(vec![0xff, b'\n']);
+        let error =
+            super::read_command_line_from(&mut input).expect_err("invalid UTF-8 must be rejected");
+
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "command is not valid UTF-8");
+    }
+
+    #[test]
+    fn server_accepts_status_and_cancel_while_transcribing() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let server = TestServer::new(runtime_with_transcriber(Box::new(BlockingTranscriber {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        })));
+
+        assert_eq!(
+            server.send(AgentCommand::Start),
+            Ok("OK state=recording".to_owned())
+        );
+        let endpoint = server.endpoint.clone();
+        let stop = thread::spawn(move || super::send_command(&endpoint, AgentCommand::Stop));
+
+        entered.wait();
+        assert_eq!(
+            server.send(AgentCommand::Status),
+            Ok("OK state=transcribing".to_owned())
+        );
+        assert_eq!(
+            server.send(AgentCommand::Toggle),
+            Err("agent is busy: state=transcribing".to_owned())
+        );
+        assert_eq!(
+            server.send(AgentCommand::Cancel),
+            Ok("OK cancel requested".to_owned())
+        );
+
+        release.wait();
+        assert_eq!(
+            stop.join().expect("stop client must finish"),
+            Err("operation cancelled".to_owned())
+        );
+        assert_eq!(
+            server.send(AgentCommand::Status),
+            Ok("OK state=idle".to_owned())
+        );
+    }
+
+    #[test]
+    fn malformed_connections_do_not_stop_the_server() {
+        let server = TestServer::new(runtime());
+        let _slow_connection =
+            TcpStream::connect(&server.endpoint).expect("slow connection must connect");
+
+        assert_eq!(
+            server.send(AgentCommand::Status),
+            Ok("OK state=idle".to_owned())
+        );
+
+        let mut invalid_utf8 =
+            TcpStream::connect(&server.endpoint).expect("invalid connection must connect");
+        invalid_utf8
+            .write_all(&[0xff, b'\n'])
+            .expect("invalid command must be written");
+
+        let mut oversized =
+            TcpStream::connect(&server.endpoint).expect("oversized connection must connect");
+        oversized
+            .write_all(&[b'x'; super::MAX_COMMAND_BYTES + 1])
+            .expect("oversized command must be written");
+
+        assert_eq!(
+            server.send(AgentCommand::Status),
+            Ok("OK state=idle".to_owned())
+        );
+    }
+
+    #[test]
+    fn starting_a_session_resets_operation_cancellation() {
+        let mut runtime = runtime();
+        runtime.operation_cancel.cancel();
+
+        assert_eq!(
+            runtime.handle(AgentCommand::Start),
+            Ok(AgentReply::State(SessionState::Recording))
+        );
+        assert!(matches!(
+            runtime.handle(AgentCommand::Toggle),
+            Ok(AgentReply::Completed(_))
+        ));
     }
 
     #[test]
